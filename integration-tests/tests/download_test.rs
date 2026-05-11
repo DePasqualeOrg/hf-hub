@@ -9,6 +9,7 @@
 //! CI: read-only tests use HF_PROD_TOKEN, write tests use HF_CI_TOKEN against hub-ci.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
@@ -751,4 +752,159 @@ async fn test_snapshot_download_exactly_one_complete_per_file() {
             complete_counts.len()
         );
     }
+}
+
+// --- Resume tests ---
+
+/// Build a client whose cache lives in `cache_dir`. Uses prod credentials when
+/// available; returns `None` to skip the test otherwise (matches other tests
+/// in this file).
+fn cache_scoped_client(cache_dir: &Path) -> Option<HFClient> {
+    let token = std::env::var(HF_TOKEN).ok().or_else(|| resolve_prod_token())?;
+    let endpoint = std::env::var(HF_ENDPOINT).unwrap_or_else(|_| PROD_ENDPOINT.to_string());
+    Some(
+        HFClientBuilder::new()
+            .token(token)
+            .endpoint(endpoint)
+            .cache_dir(cache_dir)
+            .build()
+            .expect("Failed to create HFClient"),
+    )
+}
+
+/// Resolve the equivalent on-disk path in `dest_cache` given a canonical blob
+/// path that lives under `source_cache`. Both caches must share the layout
+/// (same repo, same etag), which is true for any two clients hitting the same
+/// file on the same Hub.
+fn rebase_under_cache(canonical: &Path, source_cache: &Path, dest_cache: &Path) -> PathBuf {
+    // On macOS, `tempdir()` returns paths under `/var/folders/...` but
+    // `canonicalize` resolves the `/var → /private/var` symlink. Resolve both
+    // sides so `strip_prefix` lines up.
+    let source = std::fs::canonicalize(source_cache).unwrap_or_else(|_| source_cache.to_path_buf());
+    let relative = canonical.strip_prefix(&source).expect("canonical path was not under source cache");
+    dest_cache.join(relative)
+}
+
+#[tokio::test]
+async fn test_resume_completes_partial_download() {
+    // Establish ground truth: download config.json once, capture the bytes
+    // and the cache-relative layout (repo folder + etag-keyed blob path).
+    let cache_a_dir = tempfile::tempdir().unwrap();
+    let Some(client_a) = cache_scoped_client(cache_a_dir.path()) else {
+        return;
+    };
+    let (owner, name) = TEST_MODEL_PARTS;
+
+    let snapshot = client_a
+        .model(owner, name)
+        .download_file()
+        .filename("config.json")
+        .send()
+        .await
+        .unwrap();
+    let blob_path = std::fs::canonicalize(&snapshot).expect("snapshot symlink should resolve");
+    let full_bytes = std::fs::read(&blob_path).expect("blob should be readable");
+    assert!(full_bytes.len() > 32, "test fixture too small to split meaningfully");
+
+    // Pre-populate a fresh cache's `.incomplete` with the *correct* first half
+    // of the file, then run the same download. A working resume implementation
+    // will send `Range: bytes=N-` and only fetch the remaining bytes; a broken
+    // one would truncate-and-restart, redownloading everything.
+    let cache_b_dir = tempfile::tempdir().unwrap();
+    let cache_b_blob = rebase_under_cache(&blob_path, cache_a_dir.path(), cache_b_dir.path());
+    let cache_b_incomplete = PathBuf::from(format!("{}.incomplete", cache_b_blob.display()));
+    std::fs::create_dir_all(cache_b_incomplete.parent().unwrap()).unwrap();
+
+    let partial_size = full_bytes.len() / 2;
+    let partial_bytes = &full_bytes[..partial_size];
+    std::fs::write(&cache_b_incomplete, partial_bytes).unwrap();
+
+    let client_b = cache_scoped_client(cache_b_dir.path()).unwrap();
+    let handler = Arc::new(RecordingHandler::new());
+    let resumed_snapshot = client_b
+        .model(owner, name)
+        .download_file()
+        .filename("config.json")
+        .progress(handler.clone())
+        .send()
+        .await
+        .unwrap();
+
+    // Correctness: the final blob must byte-equal the full known content,
+    // regardless of how the patch got there.
+    let resumed_bytes = std::fs::read(&resumed_snapshot).unwrap();
+    assert_eq!(
+        Sha256::digest(&resumed_bytes),
+        Sha256::digest(&full_bytes),
+        "resumed download must produce byte-identical content to a clean download"
+    );
+
+    // Resume actually fired: the first Started event reports a non-zero
+    // initial offset – which is the patch's signal that it picked up the
+    // existing bytes from `.incomplete`. A truncate-and-restart implementation
+    // would start from 0.
+    let events = handler.events();
+    let first_started_offset = events
+        .iter()
+        .find_map(|e| match e {
+            ProgressEvent::Download(DownloadEvent::Progress { files }) => files
+                .iter()
+                .find(|f| f.status == FileStatus::Started)
+                .map(|f| f.bytes_completed),
+            _ => None,
+        })
+        .expect("should have emitted a Started progress event");
+    assert_eq!(
+        first_started_offset, partial_size as u64,
+        "Started event should report the resume offset, not 0 (truncate-and-restart)"
+    );
+}
+
+#[tokio::test]
+async fn test_force_download_clears_incomplete() {
+    // Same setup: capture ground truth bytes + layout.
+    let cache_a_dir = tempfile::tempdir().unwrap();
+    let Some(client_a) = cache_scoped_client(cache_a_dir.path()) else {
+        return;
+    };
+    let (owner, name) = TEST_MODEL_PARTS;
+
+    let snapshot = client_a
+        .model(owner, name)
+        .download_file()
+        .filename("config.json")
+        .send()
+        .await
+        .unwrap();
+    let blob_path = std::fs::canonicalize(&snapshot).unwrap();
+    let full_bytes = std::fs::read(&blob_path).unwrap();
+
+    // Populate a fresh cache's `.incomplete` with *garbage* of plausible size.
+    // If `force_download(true)` did not clear it, the resume code would append
+    // the upstream remainder to the garbage prefix and produce corrupt
+    // content. The patched code wipes the partial before resume can kick in.
+    let cache_b_dir = tempfile::tempdir().unwrap();
+    let cache_b_blob = rebase_under_cache(&blob_path, cache_a_dir.path(), cache_b_dir.path());
+    let cache_b_incomplete = PathBuf::from(format!("{}.incomplete", cache_b_blob.display()));
+    std::fs::create_dir_all(cache_b_incomplete.parent().unwrap()).unwrap();
+
+    let garbage = vec![0xFFu8; full_bytes.len() / 2];
+    std::fs::write(&cache_b_incomplete, &garbage).unwrap();
+
+    let client_b = cache_scoped_client(cache_b_dir.path()).unwrap();
+    let resumed_snapshot = client_b
+        .model(owner, name)
+        .download_file()
+        .filename("config.json")
+        .force_download(true)
+        .send()
+        .await
+        .unwrap();
+
+    let resumed_bytes = std::fs::read(&resumed_snapshot).unwrap();
+    assert_eq!(
+        Sha256::digest(&resumed_bytes),
+        Sha256::digest(&full_bytes),
+        "force_download(true) must discard the partial and produce the canonical content"
+    );
 }

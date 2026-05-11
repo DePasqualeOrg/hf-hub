@@ -651,6 +651,11 @@ impl<T: RepoType> HFRepository<T> {
             std::fs::create_dir_all(parent)?;
         }
 
+        // `.incomplete` is an atomicity marker only on the xet path: xet-core
+        // opens this file with `truncate(true)` on every download attempt, so
+        // it does not preserve partial bytes the way the LFS path's
+        // `.incomplete` does. Cross-attempt resume comes from the chunk cache
+        // at `<HF_HOME>/xet/chunk-cache/`, not from this file.
         let incomplete_path = PathBuf::from(format!("{}.incomplete", path.display()));
 
         let (session, generation) = self.hf_client.xet_session()?;
