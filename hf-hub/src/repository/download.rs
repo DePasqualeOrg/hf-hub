@@ -13,8 +13,9 @@
 
 #[cfg(not(target_family = "wasm"))]
 use std::{
-    io::Write,
+    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use bon::bon;
@@ -22,7 +23,7 @@ use bon::bon;
 use futures::TryStreamExt;
 use futures::stream::{Stream, StreamExt};
 #[cfg(not(target_family = "wasm"))]
-use reqwest::header::IF_NONE_MATCH;
+use reqwest::header::{HeaderValue, IF_NONE_MATCH, RANGE};
 #[cfg(not(target_family = "wasm"))]
 use serde::Deserialize;
 
@@ -325,14 +326,20 @@ impl<T: RepoType> HFRepository<T> {
             std::fs::create_dir_all(parent)?;
         }
 
-        stream_response_to_file_with_progress(
+        // `local_dir` downloads have no `.incomplete` convention – open
+        // truncating so a partial file from a previous interrupted run is
+        // overwritten. Resume only applies to the cache path below.
+        let mut dest_file = std::fs::File::create(&dest_path)?;
+        let (_, result) = stream_response_to_file_with_progress(
             response,
-            &dest_path,
+            &mut dest_file,
             &params.progress,
             Some(&params.filename),
             file_size,
+            0,
         )
-        .await?;
+        .await;
+        result?;
         params.progress.emit(DownloadEvent::Progress {
             files: vec![FileProgress {
                 filename: params.filename.clone(),
@@ -552,19 +559,23 @@ impl<T: RepoType> HFRepository<T> {
             std::fs::create_dir_all(parent)?;
         }
 
-        let dl_headers = self.hf_client.auth_headers();
-        let response = retry::retry(self.hf_client.retry_config(), || {
-            self.hf_client.http_client().get(&url).headers(dl_headers.clone()).send()
-        })
-        .await?;
-        stream_response_to_file_with_progress(
-            response,
+        // Mirror `huggingface_hub`'s behavior: an explicit `force_download`
+        // means "start fresh", so discard any leftover partial bytes before
+        // resume logic gets a chance to pick them up.
+        if force_download && incomplete_path.exists() {
+            std::fs::remove_file(&incomplete_path)?;
+        }
+
+        self.download_with_resume_to_file(
+            &url,
+            &repo_path,
             &incomplete_path,
+            file_size,
             &params.progress,
             Some(&params.filename),
-            file_size,
         )
         .await?;
+
         params.progress.emit(DownloadEvent::Progress {
             files: vec![FileProgress {
                 filename: params.filename.clone(),
@@ -576,6 +587,119 @@ impl<T: RepoType> HFRepository<T> {
         std::fs::rename(&incomplete_path, &blob)?;
 
         finalize_cached_file(cache_dir, repo_folder, revision, &commit_hash, &params.filename, &etag).await
+    }
+
+    /// Download a file into `incomplete_path` with cross-process resume.
+    ///
+    /// If `incomplete_path` already exists with N bytes, sends
+    /// `Range: bytes=N-` and appends the remainder. On a transient
+    /// mid-stream error (connect, timeout, 5xx body close) the GET is
+    /// reissued with an updated Range header up to
+    /// [`STREAM_RETRY_BUDGET`] times. The budget resets each time a call
+    /// actually wrote any bytes – a slow but progressing connection
+    /// finishes; a connection that produces no bytes terminates.
+    ///
+    /// Returns once the body is fully written. The caller is responsible
+    /// for renaming the file to its final blob path.
+    #[cfg(not(target_family = "wasm"))]
+    async fn download_with_resume_to_file(
+        &self,
+        url: &str,
+        repo_path: &str,
+        incomplete_path: &Path,
+        file_size: u64,
+        progress: &Option<Progress>,
+        filename: Option<&str>,
+    ) -> HFResult<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(incomplete_path)?;
+
+        let auth_headers = self.hf_client.auth_headers();
+        let mut retries_left = STREAM_RETRY_BUDGET;
+        loop {
+            let resume_size = file.metadata()?.len();
+
+            // No size-based early exit: `file_size` here comes from HEAD's
+            // `Content-Length` / `X-Linked-Size`, which for a gzip-encoded
+            // response reflects the *compressed* byte count. Reqwest then
+            // streams the *decoded* body, so comparing `resume_size` against
+            // `file_size` would conflate two unrelated quantities. The
+            // authoritative completion check is the response status: a
+            // Range request past EOF returns 416, handled below.
+
+            let mut headers = auth_headers.clone();
+            if resume_size > 0
+                && let Ok(hv) = HeaderValue::from_str(&format!("bytes={resume_size}-"))
+            {
+                headers.insert(RANGE, hv);
+            }
+
+            let response = retry::retry(self.hf_client.retry_config(), || {
+                self.hf_client.http_client().get(url).headers(headers.clone()).send()
+            })
+            .await?;
+
+            // 416 Range Not Satisfiable: the local partial is at or past
+            // the server's current EOF. Either it's already complete (no
+            // op needed) or the upstream file shrank since we started.
+            // Clearing the partial and looping reissues without Range,
+            // which proves which case we're in: a 200 with the correct
+            // bytes finalizes; any other status surfaces via check_response.
+            if response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                tracing::debug!(url = url, resume_size, "server returned 416, discarding partial and restarting fresh");
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+                continue;
+            }
+
+            // For non-2xx that retry::retry didn't already drop (i.e. non-
+            // transient 4xx), surface via the standard error mapping
+            // rather than streaming an error body into `.incomplete`.
+            let response = self
+                .hf_client
+                .check_response(
+                    response,
+                    Some(repo_path),
+                    crate::error::NotFoundContext::Entry {
+                        path: filename.unwrap_or("").to_string(),
+                    },
+                )
+                .await?;
+
+            if resume_size > 0 && response.status() == reqwest::StatusCode::OK {
+                tracing::debug!(url = url, resume_size, "server ignored Range header, restarting download from byte 0");
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+            }
+
+            let (bytes_read, result) =
+                stream_response_to_file_with_progress(response, &mut file, progress, filename, file_size, resume_size)
+                    .await;
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) if e.is_transient() => {
+                    if bytes_read > 0 {
+                        retries_left = STREAM_RETRY_BUDGET;
+                    } else if retries_left == 0 {
+                        return Err(e);
+                    } else {
+                        retries_left -= 1;
+                    }
+                    tracing::warn!(
+                        error = %e,
+                        bytes_read,
+                        retries_left,
+                        "transient error mid-stream, retrying"
+                    );
+                    tokio::time::sleep(STREAM_RETRY_DELAY).await;
+                },
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -972,15 +1096,41 @@ async fn download_concurrently<T: RepoType>(
         .await
 }
 
+/// Maximum number of recovery attempts for transient stream errors when
+/// downloading to the cache. Each successful chunk read resets the budget,
+/// so a connection that delivers any data before each drop keeps making
+/// progress indefinitely; a connection that never produces bytes gives up
+/// after this many tries.
+#[cfg(not(target_family = "wasm"))]
+const STREAM_RETRY_BUDGET: usize = 5;
+
+/// Delay between mid-stream retry attempts. Matches `huggingface_hub`'s
+/// `time.sleep(1)` between recursive `http_get` retries.
+#[cfg(not(target_family = "wasm"))]
+const STREAM_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Stream a response body into an already-open file, emitting per-chunk
+/// progress events. The caller owns the file handle so it can choose the
+/// open mode (truncating for `local_dir`, append for cache `.incomplete`
+/// resume).
+///
+/// `initial_offset` is the number of bytes already on disk before this
+/// call. Progress events report cumulative position
+/// (`initial_offset + bytes_read_this_call`) so consumers see a smooth
+/// counter across resume attempts.
+///
+/// Returns `(bytes_read_this_call, Result)`. The byte count is reported
+/// even on error so the caller can decide whether the call made enough
+/// progress to reset its retry budget.
 #[cfg(not(target_family = "wasm"))]
 async fn stream_response_to_file_with_progress(
     response: reqwest::Response,
-    dest: &Path,
+    file: &mut std::fs::File,
     handler: &Option<Progress>,
     filename: Option<&str>,
     total_bytes: u64,
-) -> HFResult<()> {
-    let mut file = std::fs::File::create(dest)?;
+    initial_offset: u64,
+) -> (u64, HFResult<()>) {
     let mut stream = response.bytes_stream();
     let mut bytes_read: u64 = 0;
 
@@ -988,7 +1138,7 @@ async fn stream_response_to_file_with_progress(
         h.emit(DownloadEvent::Progress {
             files: vec![FileProgress {
                 filename: filename.to_string(),
-                bytes_completed: 0,
+                bytes_completed: initial_offset,
                 total_bytes,
                 status: FileStatus::Started,
             }],
@@ -996,23 +1146,30 @@ async fn stream_response_to_file_with_progress(
     }
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        file.write_all(&chunk)?;
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => return (bytes_read, Err(e.into())),
+        };
+        if let Err(e) = file.write_all(&chunk) {
+            return (bytes_read, Err(e.into()));
+        }
         bytes_read += chunk.len() as u64;
 
         if let (Some(h), Some(filename)) = (handler, filename) {
             h.emit(DownloadEvent::Progress {
                 files: vec![FileProgress {
                     filename: filename.to_string(),
-                    bytes_completed: bytes_read,
+                    bytes_completed: initial_offset + bytes_read,
                     total_bytes,
                     status: FileStatus::InProgress,
                 }],
             });
         }
     }
-    file.flush()?;
-    Ok(())
+    if let Err(e) = file.flush() {
+        return (bytes_read, Err(e.into()));
+    }
+    (bytes_read, Ok(()))
 }
 
 /// Decouple the inner byte stream from the JS-side `ReadableStream` reader cadence on wasm.
