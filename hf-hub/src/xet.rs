@@ -143,6 +143,9 @@ fn spawn_download_progress_poller(
                 bytes_completed: report.total_bytes_completed,
                 total_bytes: report.total_bytes,
                 bytes_per_sec: report.total_bytes_completion_rate,
+                transfer_bytes_completed: report.total_transfer_bytes_completed,
+                transfer_bytes: report.total_transfer_bytes,
+                transfer_bytes_per_sec: report.total_transfer_bytes_completion_rate,
             });
 
             let mut files = Vec::new();

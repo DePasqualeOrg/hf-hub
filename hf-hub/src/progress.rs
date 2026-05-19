@@ -286,13 +286,27 @@ pub enum DownloadEvent {
     /// Aggregate byte-level progress for the in-flight xet batch (~10Hz). Reports
     /// cumulative bytes for the entire batch with no per-file breakdown — xet
     /// reports aggregate stats only.
+    ///
+    /// Two byte-count dimensions are reported, mirroring the split on
+    /// [`UploadEvent::Progress`]. `bytes_completed` / `total_bytes` track bytes
+    /// flushed to disk at xorb-write boundaries — naturally chunky, and the right
+    /// driver for a "% materialized" bar. `transfer_bytes_completed` /
+    /// `transfer_bytes` track network bytes received from CAS, incremented
+    /// chunk-by-chunk — smooth, and the right driver for a "% downloaded" or
+    /// "network activity" bar.
     AggregateProgress {
-        /// Bytes downloaded so far across the in-flight xet batch.
+        /// Bytes flushed to disk so far across the in-flight xet batch.
         bytes_completed: u64,
         /// Total bytes for the in-flight xet batch.
         total_bytes: u64,
-        /// Download rate in bytes/sec. `None` until enough samples accumulate.
+        /// Rate of disk-write progress in bytes/sec. `None` until enough samples accumulate.
         bytes_per_sec: Option<f64>,
+        /// Network bytes received from CAS so far across the in-flight xet batch.
+        transfer_bytes_completed: u64,
+        /// Total network bytes the in-flight xet batch is expected to receive.
+        transfer_bytes: u64,
+        /// Rate of network transfer in bytes/sec. `None` until enough samples accumulate.
+        transfer_bytes_per_sec: Option<f64>,
     },
 
     /// Terminal event on success. Not emitted on failure — check the returned `Result`.
