@@ -386,9 +386,53 @@ pub(super) fn matches_any_glob(patterns: &[String], path: &str) -> bool {
     })
 }
 
+/// A compiled glob matcher for repo-relative paths.
+///
+/// Wraps [`globset::GlobMatcher`] with two defaults that produce sensible
+/// results for matching Hugging Face cached snapshot contents:
+///
+/// - `literal_separator(true)`. `*` and `?` do **not** match across `/`
+///   boundaries. Cross-segment matches require `**`, which must appear as a
+///   full path component (surrounded by `/` or at the start/end of the
+///   pattern, e.g., `a/**/b`, `**/a`, `a/**`, or just `**`). A `**` that is
+///   not a full component (e.g., `foo**bar`) is interpreted as a single
+///   `*` — `globset`'s standard handling, not an error.
+/// - Trailing-`/` shorthand. A pattern ending in `/` is normalized to append
+///   `*`, so `"data/"` is treated as `"data/*"` — "anything one level inside
+///   this directory". This mirrors a common Hugging Face / `huggingface_hub`
+///   convention.
+///
+/// Patterns are matched against the full repo-relative path (for example,
+/// `subdir/file.json`), not just the basename.
+#[derive(Debug, Clone)]
+pub struct GlobMatcher {
+    matcher: globset::GlobMatcher,
+}
+
+impl GlobMatcher {
+    /// Compile a glob pattern. Returns the underlying [`globset::Error`] if the
+    /// pattern is malformed (unbalanced brackets, illegal `**` placement, …).
+    pub fn new(pattern: &str) -> Result<Self, globset::Error> {
+        let normalized = if pattern.ends_with('/') {
+            format!("{pattern}*")
+        } else {
+            pattern.to_string()
+        };
+        let glob = globset::GlobBuilder::new(&normalized).literal_separator(true).build()?;
+        Ok(Self {
+            matcher: glob.compile_matcher(),
+        })
+    }
+
+    /// Whether `path` (a repo-relative path) is matched by the compiled glob.
+    pub fn is_match(&self, path: &str) -> bool {
+        self.matcher.is_match(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BlobSecurityInfo, CommitInfo, FileMetadataInfo, RepoTreeEntry, extract_file_size};
+    use super::{BlobSecurityInfo, CommitInfo, FileMetadataInfo, GlobMatcher, RepoTreeEntry, extract_file_size};
 
     fn response_with(status: u16, headers: &[(&str, &str)]) -> reqwest::Response {
         let mut builder = http::Response::builder().status(status);
@@ -569,5 +613,93 @@ mod tests {
         let json = r#"{"filename":"f","etag":"e","commit_hash":"c","xet_hash":null,"file_size":0}"#;
         let info: FileMetadataInfo = serde_json::from_str(json).unwrap();
         assert!(info.location.is_none());
+    }
+
+    #[test]
+    fn test_glob_matcher_star_does_not_cross_slash() {
+        let m = GlobMatcher::new("*.json").unwrap();
+        assert!(m.is_match("config.json"));
+        assert!(!m.is_match("subdir/config.json"));
+        assert!(!m.is_match("config.yaml"));
+    }
+
+    #[test]
+    fn test_glob_matcher_single_segment_in_subdir() {
+        let m = GlobMatcher::new("subdir/*.json").unwrap();
+        assert!(m.is_match("subdir/config.json"));
+        assert!(!m.is_match("config.json"));
+        assert!(!m.is_match("subdir/nested/config.json"));
+    }
+
+    #[test]
+    fn test_glob_matcher_double_star_recurses() {
+        let m = GlobMatcher::new("**/*.safetensors").unwrap();
+        assert!(m.is_match("model.safetensors"));
+        assert!(m.is_match("shard1/model.safetensors"));
+        assert!(m.is_match("a/b/c/model.safetensors"));
+        assert!(!m.is_match("model.bin"));
+    }
+
+    #[test]
+    fn test_glob_matcher_double_star_sandwich() {
+        let m = GlobMatcher::new("a/**/b").unwrap();
+        assert!(m.is_match("a/b"));
+        assert!(m.is_match("a/x/b"));
+        assert!(m.is_match("a/x/y/b"));
+        assert!(!m.is_match("a/x"));
+        assert!(!m.is_match("b"));
+    }
+
+    #[test]
+    fn test_glob_matcher_double_star_suffix() {
+        let m = GlobMatcher::new("foo/**").unwrap();
+        // globset: `foo/**` matches paths inside `foo/`, not `foo` itself.
+        assert!(m.is_match("foo/x"));
+        assert!(m.is_match("foo/x/y"));
+        assert!(!m.is_match("bar/x"));
+    }
+
+    #[test]
+    fn test_glob_matcher_question_mark_single_char() {
+        let m = GlobMatcher::new("file?.bin").unwrap();
+        assert!(m.is_match("file1.bin"));
+        assert!(m.is_match("fileA.bin"));
+        assert!(!m.is_match("file10.bin"));
+        assert!(!m.is_match("file.bin"));
+    }
+
+    #[test]
+    fn test_glob_matcher_trailing_slash_shorthand() {
+        let m = GlobMatcher::new("data/").unwrap();
+        assert!(m.is_match("data/file.json"));
+        assert!(m.is_match("data/nested"));
+        // Trailing-slash is `/*`, not `/**`, so it does not recurse.
+        assert!(!m.is_match("data/nested/file.json"));
+        assert!(!m.is_match("data"));
+        assert!(!m.is_match("other/file.json"));
+    }
+
+    #[test]
+    fn test_glob_matcher_literal_path() {
+        let m = GlobMatcher::new("config.json").unwrap();
+        assert!(m.is_match("config.json"));
+        assert!(!m.is_match("config.yaml"));
+        assert!(!m.is_match("subdir/config.json"));
+    }
+
+    #[test]
+    fn test_glob_matcher_double_star_outside_path_component() {
+        // globset treats `**` that isn't a full path component as a single `*`.
+        // The pattern still compiles; it just doesn't recurse across segments.
+        let m = GlobMatcher::new("foo**bar").unwrap();
+        assert!(m.is_match("foobar"));
+        assert!(m.is_match("fooXYZbar"));
+        assert!(!m.is_match("foo/bar"));
+    }
+
+    #[test]
+    fn test_glob_matcher_rejects_malformed_pattern() {
+        // Unbalanced character class.
+        assert!(GlobMatcher::new("file[.bin").is_err());
     }
 }
