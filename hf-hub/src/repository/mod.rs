@@ -24,6 +24,7 @@ pub mod diff;
 pub mod download;
 pub mod files;
 pub mod listing;
+pub mod repo_id;
 pub mod repo_type;
 pub mod upload;
 
@@ -40,6 +41,7 @@ pub use files::{
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use files::{extract_file_size, extract_xet_hash};
 use futures::Stream;
+pub use repo_id::{RepoIdValidationError, SegmentRole, validate_repo_id_segment};
 pub use repo_type::{RepoType, RepoTypeAny, RepoTypeDataset, RepoTypeKernel, RepoTypeModel, RepoTypeSpace};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize, Serializer};
