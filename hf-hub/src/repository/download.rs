@@ -37,7 +37,7 @@ use super::{HFRepository, RepoTreeEntry, RepoType};
 #[cfg(not(target_family = "wasm"))]
 use crate::cache::storage as cache;
 use crate::error::{HFError, HFResult};
-use crate::progress::{DownloadEvent, EmitEvent, FileProgress, FileStatus, Progress};
+use crate::progress::{DownloadEvent, EmitEvent, FileProgress, FileStatus, Progress, ProgressEvent, ProgressHandler};
 use crate::{constants, retry};
 
 /// Boxed byte stream returned by [`HFRepository::download_file_stream`].
@@ -924,13 +924,14 @@ impl<T: RepoType> HFRepository<T> {
                 Ok(())
             };
 
+            let per_file_progress = snapshot_per_file_progress(&params.progress);
             let non_xet_dl_params = build_download_params(
                 &repo_path,
                 &non_xet_filenames,
                 &commit_hash,
                 params.force_download,
                 Some(local_dir.clone()),
-                &params.progress,
+                &per_file_progress,
             );
             let non_xet_fut = async {
                 download_concurrently(self, &non_xet_dl_params, max_workers).await?;
@@ -992,13 +993,14 @@ impl<T: RepoType> HFRepository<T> {
             Ok(())
         };
 
+        let per_file_progress = snapshot_per_file_progress(&params.progress);
         let non_xet_dl_params = build_download_params(
             &repo_path,
             &non_xet_filenames,
             &commit_hash,
             params.force_download,
             None,
-            &params.progress,
+            &per_file_progress,
         );
         let non_xet_fut = async {
             download_concurrently(self, &non_xet_dl_params, max_workers).await?;
@@ -1056,6 +1058,36 @@ async fn finalize_cached_file(
     }
     cache::create_pointer_symlink(cache_dir, repo_folder, commit_hash, filename, etag).await?;
     Ok(cache::snapshot_path(cache_dir, repo_folder, commit_hash, filename))
+}
+
+/// Progress decorator used by `snapshot_download_impl` to suppress the
+/// per-file `DownloadEvent::Start` that each non-xet file would otherwise
+/// emit through `download_file_inner` (see `download_file_to_local_dir`
+/// and `download_file_to_cache_network`).
+///
+/// The snapshot orchestrator emits one aggregate `Start { total_files,
+/// total_bytes }` for the whole operation. Without this filter, a consumer
+/// that binds a progress bar's total to the most recent `Start.total_bytes`
+/// would see the bar repeatedly reset for every small non-xet file in the
+/// snapshot. Per-file lifecycle continues to flow through
+/// `DownloadEvent::Progress { files: [...] }`, the documented per-file
+/// channel; this filter only drops the redundant `Start`.
+#[cfg(not(target_family = "wasm"))]
+struct SnapshotPerFileFilter(Progress);
+
+#[cfg(not(target_family = "wasm"))]
+impl ProgressHandler for SnapshotPerFileFilter {
+    fn on_progress(&self, event: &ProgressEvent) {
+        if matches!(event, ProgressEvent::Download(DownloadEvent::Start { .. })) {
+            return;
+        }
+        self.0.on_progress(event);
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn snapshot_per_file_progress(progress: &Option<Progress>) -> Option<Progress> {
+    progress.as_ref().map(|p| Progress::new(SnapshotPerFileFilter(p.clone())))
 }
 
 #[cfg(not(target_family = "wasm"))]
