@@ -20,7 +20,10 @@ use bon::bon;
 use crate::client::HFClient;
 use crate::error::HFResult;
 
+pub mod deletion;
 pub(crate) mod storage;
+
+pub use deletion::{DeleteCacheStrategy, ExecuteResult, Failure, PathKind};
 
 /// A single file in a cached revision.
 ///
