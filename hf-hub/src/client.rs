@@ -112,6 +112,9 @@ impl std::fmt::Debug for HFClient {
         if self.inner.cache_enabled {
             s.field("cache_dir", &self.inner.cache_dir);
         }
+        if let Some(ref xet_cache_dir) = self.inner.xet_cache_dir {
+            s.field("xet_cache_dir", xet_cache_dir);
+        }
         s.finish()
     }
 }
@@ -127,6 +130,7 @@ pub(crate) struct HFClientInner {
     pub(crate) endpoint: String,
     pub(crate) token: Option<String>,
     pub(crate) cache_dir: std::path::PathBuf,
+    pub(crate) xet_cache_dir: Option<std::path::PathBuf>,
     pub(crate) cache_enabled: bool,
     pub(crate) xet_state: std::sync::Mutex<crate::xet::XetState>,
 }
@@ -198,6 +202,13 @@ impl HFClientBuilder {
 
     /// Sets the local cache directory. Defaults to `.cache/huggingface/hub` relative to the
     /// current working directory.
+    ///
+    /// Setting this also relocates the Xet cache: Xet-backed transfers use the
+    /// sibling `xet/` directory next to this path (`<root>/hub` → `<root>/xet`),
+    /// mirroring xet-core's own `$HF_HOME/hub` + `$HF_HOME/xet` layout. This
+    /// keeps the two caches co-located on sandboxed hosts (e.g. iOS apps) where
+    /// xet-core's environment-derived default would otherwise land outside the
+    /// writable container. See [`build`](Self::build).
     pub fn cache_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.cache_dir = Some(path.into());
         self
@@ -233,6 +244,24 @@ impl HFClientBuilder {
         let _ = url::Url::parse(&endpoint)?;
 
         let token = self.token;
+
+        // Co-locate the Xet cache with an explicitly chosen hub cache directory:
+        // `<root>/hub` → `<root>/xet`, mirroring xet-core's own default layout
+        // (`$HF_HOME/hub` alongside `$HF_HOME/xet`). Left as `None` when
+        // `cache_dir` is unset, so xet-core's environment-based resolution
+        // (`HF_XET_CACHE` / `HF_HOME` / `XDG_CACHE_HOME`) still applies.
+        //
+        // Restricted to absolute paths with a real parent: a relative or
+        // root-level `cache_dir` would derive a relative or root-level `xet`
+        // path, reintroducing the unpredictable, possibly-unwritable location
+        // this derivation exists to avoid. Such inputs fall back to `None`.
+        let xet_cache_dir = self
+            .cache_dir
+            .as_deref()
+            .filter(|dir| dir.is_absolute())
+            .and_then(|dir| dir.parent())
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.join("xet"));
 
         let cache_dir = self
             .cache_dir
@@ -274,6 +303,7 @@ impl HFClientBuilder {
                 endpoint: endpoint.trim_end_matches('/').to_string(),
                 token,
                 cache_dir,
+                xet_cache_dir,
                 cache_enabled: self.cache_enabled.unwrap_or(true),
                 xet_state: std::sync::Mutex::new(crate::xet::XetState::default()),
             }),
@@ -513,7 +543,6 @@ impl HFClient {
             return Ok((session.clone(), guard.generation));
         }
 
-        #[cfg(not(target_family = "wasm"))]
         let builder = xet::xet_session::XetSessionBuilder::new();
         // Cap transfer concurrency on wasm to avoid exhausting linear memory.
         #[cfg(target_family = "wasm")]
@@ -522,6 +551,13 @@ impl HFClient {
             config.client.ac_max_upload_concurrency = 8;
             config.client.ac_max_download_concurrency = 8;
             xet::xet_session::XetSessionBuilder::new_with_config(config)
+        };
+        // Apply the Xet cache root derived from `cache_dir`. When
+        // `xet_cache_dir` is `None` xet-core resolves it from the environment.
+        #[cfg(not(target_family = "wasm"))]
+        let builder = match self.inner.xet_cache_dir {
+            Some(ref dir) => builder.with_cache_dir(dir),
+            None => builder,
         };
         let session = builder
             .build()
