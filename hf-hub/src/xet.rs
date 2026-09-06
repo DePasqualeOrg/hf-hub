@@ -8,6 +8,7 @@
 #[cfg(not(target_family = "wasm"))]
 use std::{
     collections::HashMap,
+    io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{
         Arc,
@@ -15,7 +16,11 @@ use std::{
     },
 };
 
+#[cfg(not(target_family = "wasm"))]
+use futures::StreamExt;
 use serde::Deserialize;
+#[cfg(not(target_family = "wasm"))]
+use sha2::{Digest, Sha256};
 #[cfg(test)]
 use xet::error::XetError;
 use xet::xet_session::XetFileInfo;
@@ -630,79 +635,111 @@ impl<T: RepoType> HFRepository<T> {
         Ok(dest_path)
     }
 
+    /// The caller holds the blob lock until this method returns.
     pub(crate) async fn xet_download_to_blob(
         &self,
         revision: &str,
-        filename: &str,
-        file_hash: &str,
-        file_size: u64,
-        path: &std::path::Path,
+        file: &XetBatchFile,
+        etag: &str,
+        force: bool,
         progress: &Option<Progress>,
     ) -> HFResult<()> {
-        let repo_path = self.repo_path();
-        let api_segment = self.repo_type.plural();
-        let token_url = repo_xet_token_url(&self.hf_client, "read", &repo_path, api_segment, revision);
-        let conn = fetch_xet_connection_info(
-            &self.hf_client,
-            &token_url,
-            Some(&repo_path),
-            crate::error::NotFoundContext::Repo,
-        )
-        .await?;
-
-        if let Some(parent) = path.parent() {
+        let emit = |bytes_completed, status| {
+            progress.emit(DownloadEvent::Progress {
+                files: vec![FileProgress {
+                    filename: file.filename.clone(),
+                    bytes_completed,
+                    total_bytes: file.file_size,
+                    status,
+                }],
+            });
+        };
+        // Recheck after acquiring the lock: another caller may have finished it.
+        if file.path.exists() && !force {
+            emit(file.file_size, FileStatus::Complete);
+            return Ok(());
+        }
+        if let Some(parent) = file.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-
-        // `.incomplete` is an atomicity marker only on the xet path: xet-core
-        // opens this file with `truncate(true)` on every download attempt, so
-        // it does not preserve partial bytes the way the LFS path's
-        // `.incomplete` does. Cross-attempt resume comes from the chunk cache
-        // at `<HF_HOME>/xet/chunk-cache/`, not from this file.
-        let incomplete_path = PathBuf::from(format!("{}.incomplete", path.display()));
-
-        let (session, generation) = self.hf_client.xet_session()?;
-        let group = match session.new_file_download_group() {
-            Ok(b) => b,
-            Err(e) => {
-                self.hf_client.replace_xet_session(generation, &e);
-                self.hf_client
-                    .xet_session()?
-                    .0
-                    .new_file_download_group()
-                    .map_err(|e| HFError::xet(XetOperation::Download, e))?
-            },
+        // A zero may mean a missing size header; only a known empty digest proves emptiness.
+        if file.file_size == 0
+            && !etag.eq_ignore_ascii_case("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        {
+            return Err(HFError::malformed_response("Xet cache download is missing a valid file size"));
         }
-        .with_endpoint(conn.endpoint.clone())
-        .with_token_info(conn.access_token.clone(), conn.expiration_unix_epoch)
-        .with_token_refresh_url(token_url, self.hf_client.auth_headers())
-        .build()
-        .await
-        .map_err(|e| HFError::xet(XetOperation::Download, e))?;
-
-        let file_info = XetFileInfo::new(file_hash.to_string(), file_size);
-
-        let handle = group
-            .download_file_to_path(file_info, incomplete_path.clone())
-            .await
-            .map_err(|e| HFError::xet(XetOperation::Download, e))?;
-
-        let tracked = Arc::new(vec![TrackedDownload {
-            handle,
-            filename: filename.to_string(),
-            file_size,
-            complete_emitted: AtomicBool::new(false),
-        }]);
-        let poll_handle = spawn_download_progress_poller(progress, &group, Arc::clone(&tracked));
-
-        let result = group.finish().await;
-        if let Some(h) = poll_handle {
-            h.abort();
+        let incomplete = PathBuf::from(format!("{}.incomplete", file.path.display()));
+        let mut output = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&incomplete)?;
+        let mut completed = output.metadata()?.len();
+        // Only reuse a prefix when the Hub supplies a verifiable content digest.
+        let expected_sha256 = etag.len() == 64 && etag.bytes().all(|b| b.is_ascii_hexdigit());
+        if force || completed > file.file_size || !expected_sha256 {
+            output.set_len(0)?;
+            completed = 0;
         }
-        result.map_err(|e| HFError::xet(XetOperation::Download, e))?;
-        emit_remaining_completes(progress, &tracked);
+        emit(completed, FileStatus::Started);
 
-        std::fs::rename(&incomplete_path, path)?;
+        let mut digest = Sha256::new();
+        if expected_sha256 {
+            let mut buffer = vec![0; 256 * 1024];
+            loop {
+                let count = output.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                digest.update(&buffer[..count]);
+                // Keep cancellation responsive while checking a large retained prefix.
+                tokio::task::yield_now().await;
+            }
+        }
+        output.seek(SeekFrom::Start(completed))?;
+        if completed < file.file_size {
+            let stream = self
+                .xet_download_stream(revision, &file.hash, file.file_size, Some(completed..file.file_size))
+                .await?;
+            futures::pin_mut!(stream);
+            while let Some(bytes) = stream.next().await {
+                let bytes = bytes?;
+                if bytes.len() as u64 > file.file_size - completed {
+                    return Err(HFError::malformed_response("Xet stream exceeded the expected file size"));
+                }
+                // The consuming future owns all writes; dropping it leaves a contiguous prefix.
+                output.write_all(&bytes)?;
+                digest.update(&bytes);
+                completed += bytes.len() as u64;
+                emit(completed, FileStatus::InProgress);
+                tokio::task::yield_now().await;
+            }
+        }
+        if completed != file.file_size {
+            return Err(HFError::malformed_response(format!(
+                "Xet stream ended at {completed} bytes; expected {}",
+                file.file_size
+            )));
+        }
+        if expected_sha256
+            && !digest
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+                .eq_ignore_ascii_case(etag)
+        {
+            // Discard a corrupt prefix so a subsequent attempt can recover.
+            output.set_len(0)?;
+            return Err(HFError::malformed_response(
+                "Xet download SHA-256 does not match the Hub ETag; retry the download",
+            ));
+        }
+        output.sync_all()?;
+        drop(output);
+        std::fs::rename(&incomplete, &file.path)?;
+        emit(file.file_size, FileStatus::Complete);
         Ok(())
     }
 
@@ -1103,3 +1140,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "xet_resume_tests.rs"]
+mod resume_tests;
