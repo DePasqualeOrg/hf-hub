@@ -321,7 +321,8 @@ pub struct FileProgress {
     /// Path as known by the repository or bucket (the `path_in_repo` used when
     /// uploading, or the remote path as returned from tree listing).
     pub filename: String,
-    /// Bytes transferred so far for this file.
+    /// Logical bytes transferred so far for this file. Cached Xet downloads include
+    /// an estimate of incoming compressed data; this is not a durable resume offset.
     pub bytes_completed: u64,
     /// Total bytes expected for this file. Zero when the size is unknown (e.g.,
     /// fast-path cached files emitted purely to signal completion).

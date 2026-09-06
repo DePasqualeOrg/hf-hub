@@ -12,12 +12,10 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
-#[cfg(not(target_family = "wasm"))]
-use futures::StreamExt;
 use serde::Deserialize;
 #[cfg(not(target_family = "wasm"))]
 use sha2::{Digest, Sha256};
@@ -644,7 +642,10 @@ impl<T: RepoType> HFRepository<T> {
         force: bool,
         progress: &Option<Progress>,
     ) -> HFResult<()> {
+        let reported = AtomicU64::new(0);
         let emit = |bytes_completed, status| {
+            let previous = reported.fetch_max(bytes_completed, Ordering::Relaxed);
+            let bytes_completed = bytes_completed.max(previous);
             progress.emit(DownloadEvent::Progress {
                 files: vec![FileProgress {
                     filename: file.filename.clone(),
@@ -699,21 +700,52 @@ impl<T: RepoType> HFRepository<T> {
         }
         output.seek(SeekFrom::Start(completed))?;
         if completed < file.file_size {
-            let stream = self
-                .xet_download_stream(revision, &file.hash, file.file_size, Some(completed..file.file_size))
+            let retained = completed;
+            let (mut stream, group) = self
+                .new_xet_download_stream(revision, &file.hash, file.file_size, Some(retained..file.file_size))
                 .await?;
-            futures::pin_mut!(stream);
-            while let Some(bytes) = stream.next().await {
-                let bytes = bytes?;
-                if bytes.len() as u64 > file.file_size - completed {
-                    return Err(HFError::malformed_response("Xet stream exceeded the expected file size"));
+            let download = async {
+                while let Some(bytes) =
+                    stream.next().await.map_err(|e| HFError::xet(XetOperation::StreamDownload, e))?
+                {
+                    if bytes.len() as u64 > file.file_size - completed {
+                        return Err(HFError::malformed_response("Xet stream exceeded the expected file size"));
+                    }
+                    // The consuming future owns all writes; dropping it leaves a contiguous prefix.
+                    output.write_all(&bytes)?;
+                    digest.update(&bytes);
+                    completed += bytes.len() as u64;
+                    emit(completed.min(file.file_size - 1), FileStatus::InProgress);
+                    tokio::task::yield_now().await;
                 }
-                // The consuming future owns all writes; dropping it leaves a contiguous prefix.
-                output.write_all(&bytes)?;
-                digest.update(&bytes);
-                completed += bytes.len() as u64;
-                emit(completed, FileStatus::InProgress);
-                tokio::task::yield_now().await;
+                Ok::<_, HFError>(())
+            };
+            let report = async {
+                if progress.is_none() {
+                    std::future::pending::<()>().await;
+                }
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    let report = group.progress();
+                    // Scale only discovered reconstruction bytes, not the whole remaining file.
+                    // Compressed transfer totals can grow as Xet discovers further blocks.
+                    let transferred = if report.total_transfer_bytes > 0 {
+                        ((u128::from(report.total_transfer_bytes_completed.min(report.total_transfer_bytes))
+                            * u128::from(report.total_bytes))
+                            / u128::from(report.total_transfer_bytes)) as u64
+                    } else {
+                        0
+                    };
+                    let downloaded = transferred.max(report.total_bytes_completed).min(file.file_size - retained);
+                    emit((retained + downloaded).min(file.file_size - 1), FileStatus::InProgress);
+                }
+            };
+            // Poll alongside the intact read future: Xet's next() must not be cancelled on each tick.
+            tokio::select! {
+                result = download => result?,
+                () = report => {},
             }
         }
         if completed != file.file_size {
@@ -1035,6 +1067,23 @@ impl<T: RepoType> HFRepository<T> {
         file_size: u64,
         range: Option<std::ops::Range<u64>>,
     ) -> HFResult<impl futures::Stream<Item = HFResult<bytes::Bytes>> + use<T>> {
+        let (stream, _group) = self.new_xet_download_stream(revision, file_hash, file_size, range).await?;
+        Ok(futures::stream::unfold(stream, |mut stream| async move {
+            match stream.next().await {
+                Ok(Some(bytes)) => Some((Ok(bytes), stream)),
+                Ok(None) => None,
+                Err(e) => Some((Err(HFError::xet(XetOperation::StreamDownload, e)), stream)),
+            }
+        }))
+    }
+
+    async fn new_xet_download_stream(
+        &self,
+        revision: &str,
+        file_hash: &str,
+        file_size: u64,
+        range: Option<std::ops::Range<u64>>,
+    ) -> HFResult<(xet::xet_session::XetDownloadStream, xet::xet_session::XetDownloadStreamGroup)> {
         let repo_path = self.repo_path();
         let api_segment = self.repo_type.plural();
         let token_url = repo_xet_token_url(&self.hf_client, "read", &repo_path, api_segment, revision);
@@ -1064,13 +1113,7 @@ impl<T: RepoType> HFRepository<T> {
 
         stream.start();
 
-        Ok(futures::stream::unfold(stream, |mut stream| async move {
-            match stream.next().await {
-                Ok(Some(bytes)) => Some((Ok(bytes), stream)),
-                Ok(None) => None,
-                Err(e) => Some((Err(HFError::xet(XetOperation::StreamDownload, e)), stream)),
-            }
-        }))
+        Ok((stream, group))
     }
 
     /// Obtain a stream-download group builder from the cached `XetSession`,
