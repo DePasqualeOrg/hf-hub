@@ -218,6 +218,7 @@ fn event_to_js(event: &ProgressEvent) -> JsValue {
             bytes_completed,
             total_bytes,
             bytes_per_sec,
+            ..
         }) => {
             set_kind(&obj, "download.aggregate_progress");
             set_number(&obj, "bytes_completed", *bytes_completed as f64);

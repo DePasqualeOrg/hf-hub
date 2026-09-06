@@ -38,7 +38,9 @@ use super::{HFRepository, RepoTreeEntry, RepoType};
 #[cfg(not(target_family = "wasm"))]
 use crate::cache::storage as cache;
 use crate::error::{HFError, HFResult};
-use crate::progress::{DownloadEvent, EmitEvent, FileProgress, FileStatus, Progress, ProgressEvent, ProgressHandler};
+use crate::progress::{DownloadEvent, EmitEvent, FileProgress, FileStatus, Progress};
+#[cfg(not(target_family = "wasm"))]
+use crate::progress::{ProgressEvent, ProgressHandler};
 use crate::{constants, retry};
 
 /// Boxed byte stream returned by [`HFRepository::download_file_stream`].
@@ -587,13 +589,14 @@ impl<T: RepoType> HFRepository<T> {
                 return Ok(snapshot_path);
             }
             let new_blob = !blob.exists();
-            if new_blob || force_download {
-                if let Some(parent) = blob.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                self.xet_download_to_blob(revision, &params.filename, &xet_hash, file_size, &blob, &params.progress)
-                    .await?;
-            }
+            let file = crate::xet::XetBatchFile {
+                hash: xet_hash,
+                file_size,
+                path: blob,
+                filename: params.filename.clone(),
+            };
+            self.xet_download_to_blob(&commit_hash, &file, &etag, force_download, &params.progress)
+                .await?;
 
             return finalize_cached_file(
                 &lock,
@@ -897,11 +900,18 @@ impl<T: RepoType> HFRepository<T> {
         let total_files = filenames.len();
         let force = params.force_download;
 
-        let mut cached_filenames = Vec::new();
+        let mut cached_files = Vec::new();
         if !force && params.local_dir.is_none() {
             filenames.retain(|f| {
-                if cache::snapshot_path(cache_dir, &repo_folder, &commit_hash, f).exists() {
-                    cached_filenames.push(f.clone());
+                if let Ok(metadata) = cache::snapshot_path(cache_dir, &repo_folder, &commit_hash, f).metadata()
+                    && metadata.is_file()
+                {
+                    cached_files.push(FileProgress {
+                        filename: f.clone(),
+                        bytes_completed: metadata.len(),
+                        total_bytes: metadata.len(),
+                        status: FileStatus::Complete,
+                    });
                     false
                 } else {
                     true
@@ -970,23 +980,42 @@ impl<T: RepoType> HFRepository<T> {
             .flatten()
             .collect();
 
-        let total_bytes: u64 = file_metas.iter().map(|m| m.file_size).sum();
+        let total_bytes: u64 = file_metas.iter().map(|m| m.file_size).sum::<u64>()
+            + cached_files.iter().map(|f| f.total_bytes).sum::<u64>();
         params.progress.emit(DownloadEvent::Start {
             total_files,
             total_bytes,
         });
-        if !cached_filenames.is_empty() {
-            params.progress.emit(DownloadEvent::Progress {
-                files: cached_filenames
-                    .iter()
-                    .map(|f| FileProgress {
-                        filename: f.clone(),
-                        bytes_completed: 0,
-                        total_bytes: 0,
-                        status: FileStatus::Complete,
-                    })
-                    .collect(),
-            });
+        // Publish a complete initial byte inventory before bounded transfers can wait on locks.
+        // These counts are advisory; each writer rechecks its partial under the blob lock.
+        if params.local_dir.is_none() {
+            for meta in &file_metas {
+                let blob = cache::blob_path(cache_dir, &repo_folder, &meta.etag);
+                let can_resume = meta.xet_hash.is_none()
+                    || (meta.etag.len() == 64 && meta.etag.bytes().all(|b| b.is_ascii_hexdigit()));
+                let bytes_completed = if force {
+                    0
+                } else if blob.exists() {
+                    meta.file_size
+                } else if can_resume {
+                    std::fs::metadata(format!("{}.incomplete", blob.display()))
+                        .map(|m| m.len())
+                        .ok()
+                        .filter(|size| *size <= meta.file_size)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                cached_files.push(FileProgress {
+                    filename: meta.filename.clone(),
+                    bytes_completed,
+                    total_bytes: meta.file_size,
+                    status: FileStatus::Started,
+                });
+            }
+        }
+        if !cached_files.is_empty() {
+            params.progress.emit(DownloadEvent::Progress { files: cached_files });
         }
 
         let mut xet_metas = Vec::new();
@@ -1185,7 +1214,25 @@ impl<T: RepoType> HFRepository<T> {
                     files: locked_cached_progress,
                 });
             }
-            self.xet_download_batch(&commit_hash, &batch_files, &params.progress).await?;
+            // Each blob is downloaded through the resumable single-file path, which keeps
+            // a verified `.incomplete` prefix across interruptions. The locks are held above.
+            let progress = &params.progress;
+            // Owned jobs keep the per-blob futures free of borrowed closure arguments, which
+            // the snapshot future needs to stay `Send` in generic async contexts.
+            let jobs: Vec<(crate::xet::XetBatchFile, String, String)> = batch_files
+                .into_iter()
+                .zip(pending_groups.iter())
+                .map(|(file, (etag, _, metas))| {
+                    let commit = metas.first().map_or_else(|| commit_hash.clone(), |m| m.commit_hash.clone());
+                    (file, etag.clone(), commit)
+                })
+                .collect();
+            futures::stream::iter(jobs.into_iter().map(|(file, etag, commit)| async move {
+                self.xet_download_to_blob(&commit, &file, &etag, force, progress).await
+            }))
+            .buffer_unordered(max_workers)
+            .try_collect::<Vec<_>>()
+            .await?;
 
             for (etag, new_blob, metas) in pending_groups {
                 let lock = locks
