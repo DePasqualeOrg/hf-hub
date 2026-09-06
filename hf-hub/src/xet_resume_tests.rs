@@ -26,6 +26,7 @@ struct Events {
     files: Mutex<Vec<FileProgress>>,
     total: Mutex<Option<u64>>,
     initial: Mutex<Option<Vec<FileProgress>>>,
+    changed: tokio::sync::Notify,
 }
 
 impl ProgressHandler for Events {
@@ -33,6 +34,7 @@ impl ProgressHandler for Events {
         if let ProgressEvent::Download(DownloadEvent::Progress { files }) = event {
             self.initial.lock().unwrap().get_or_insert_with(|| files.clone());
             self.files.lock().unwrap().extend(files.clone());
+            self.changed.notify_one();
         } else if let ProgressEvent::Download(DownloadEvent::Start { total_bytes, .. }) = event {
             *self.total.lock().unwrap() = Some(*total_bytes);
         }
@@ -46,6 +48,8 @@ struct ServerState {
     etag: String,
     size: usize,
     omit_size: AtomicBool,
+    hold_payload: AtomicBool,
+    payload_permits: tokio::sync::Semaphore,
     client: reqwest::Client,
     ranges: Mutex<Vec<String>>,
     payload_bytes: Mutex<usize>,
@@ -125,7 +129,22 @@ async fn handle(State(state): State<Arc<ServerState>>, request: Request) -> Resp
     if path.contains("fetch_term") {
         *state.payload_bytes.lock().unwrap() += body.len();
     }
-    let mut response = Response::builder().status(status).body(Body::from(body)).unwrap();
+    let body = if path.contains("fetch_term") && state.hold_payload.load(Ordering::Relaxed) {
+        // Deliver part of every term, then wait for the test to allow further network bytes.
+        Body::from_stream(futures::stream::unfold((body, state, true), |(mut bytes, state, first)| async move {
+            if bytes.is_empty() {
+                return None;
+            }
+            if !first && let Ok(permit) = state.payload_permits.acquire().await {
+                permit.forget();
+            }
+            let chunk = bytes.split_to(bytes.len().min(16 * 1024));
+            Some((Ok::<_, std::io::Error>(chunk), (bytes, state, false)))
+        }))
+    } else {
+        Body::from(body)
+    };
+    let mut response = Response::builder().status(status).body(body).unwrap();
     *response.headers_mut() = headers;
     response
 }
@@ -208,6 +227,8 @@ impl Fixture {
             etag,
             size: data.len(),
             omit_size: AtomicBool::new(false),
+            hold_payload: AtomicBool::new(false),
+            payload_permits: tokio::sync::Semaphore::new(0),
             client,
             ranges: Mutex::default(),
             payload_bytes: Mutex::default(),
@@ -376,7 +397,7 @@ async fn cached_xet_resumes_decoded_bytes_and_checks_integrity() {
         // Cancellation drops the writer before releasing its blob lock.
         std::fs::remove_file(&blob).unwrap();
         let (start, ready) = tokio::sync::oneshot::channel();
-        let cancellation = Arc::new(AbortAfterWrite(Mutex::new(None)));
+        let cancellation = Arc::new(AbortAfterWrite(Mutex::new(None), fixture.partial()));
         let handler = cancellation.clone();
         let cancelled_repo = repo.clone();
         let task = tokio::spawn(async move {
@@ -410,6 +431,7 @@ async fn cached_xet_resumes_decoded_bytes_and_checks_integrity() {
                 ])
                 .env("HF_RESUME_TEST_ENDPOINT", &fixture.state.endpoint)
                 .env("HF_RESUME_TEST_CACHE", fixture.temp.path().join("hub"))
+                .env("HF_RESUME_TEST_PARTIAL", fixture.partial())
                 .kill_on_drop(true)
                 .output()
                 .await
@@ -445,13 +467,17 @@ async fn cached_xet_resumes_decoded_bytes_and_checks_integrity() {
     .expect("local Xet resume test timed out");
 }
 
-struct ExitAfterWrite;
+struct ExitAfterWrite {
+    partial: PathBuf,
+    retained: u64,
+}
 impl ProgressHandler for ExitAfterWrite {
     fn on_progress(&self, event: &ProgressEvent) {
         if let ProgressEvent::Download(DownloadEvent::Progress { files }) = event
             && files
                 .iter()
                 .any(|f| f.status == FileStatus::InProgress && f.bytes_completed > 0)
+            && std::fs::metadata(&self.partial).is_ok_and(|m| m.len() > self.retained)
         {
             std::process::exit(87);
         }
@@ -473,20 +499,25 @@ async fn cached_xet_interrupted_child() {
         .model("fixture", "resume")
         .download_file()
         .filename("model.bin")
-        .progress(ExitAfterWrite)
+        .progress({
+            let partial = PathBuf::from(std::env::var("HF_RESUME_TEST_PARTIAL").unwrap());
+            let retained = std::fs::metadata(&partial).map_or(0, |m| m.len());
+            ExitAfterWrite { partial, retained }
+        })
         .send()
         .await
         .unwrap();
     panic!("child completed without interruption");
 }
 
-struct AbortAfterWrite(Mutex<Option<tokio::task::AbortHandle>>);
+struct AbortAfterWrite(Mutex<Option<tokio::task::AbortHandle>>, PathBuf);
 impl ProgressHandler for AbortAfterWrite {
     fn on_progress(&self, event: &ProgressEvent) {
         if let ProgressEvent::Download(DownloadEvent::Progress { files }) = event
             && files
                 .iter()
                 .any(|f| f.status == FileStatus::InProgress && f.bytes_completed > 0)
+            && std::fs::metadata(&self.1).is_ok_and(|m| m.len() > 0)
         {
             self.0.lock().unwrap().as_ref().unwrap().abort();
         }
@@ -568,4 +599,106 @@ async fn cached_xet_ffi_fixture() {
         .unwrap()
         .unwrap();
     fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_xet_reports_network_progress_before_output() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for retained in [0, 6 * 1024 * 1024 + 123] {
+            let fixture = Fixture::new(47).await;
+            let partial = fixture.partial();
+            std::fs::write(&partial, &fixture.data[..retained]).unwrap();
+            fixture.state.hold_payload.store(true, Ordering::Relaxed);
+            let events = Arc::new(Events::default());
+            let repo = fixture.client().model("fixture", "resume");
+            let download = repo.download_file().filename("model.bin").progress(events.clone()).send();
+            let observe = async {
+                let mut previous = retained as u64;
+                for _ in 0..3 {
+                    loop {
+                        let changed = events.changed.notified();
+                        let latest = events
+                            .files
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|p| p.bytes_completed)
+                            .max()
+                            .unwrap_or(0);
+                        if latest > previous {
+                            assert!(latest < fixture.data.len() as u64);
+                            assert_eq!(std::fs::metadata(&partial).unwrap().len(), retained as u64);
+                            previous = latest;
+                            break;
+                        }
+                        changed.await;
+                    }
+                    fixture.state.payload_permits.add_permits(1);
+                }
+                fixture.state.payload_permits.close();
+            };
+            let (result, ()) = tokio::join!(download, observe);
+            assert_eq!(std::fs::read(result.unwrap()).unwrap(), fixture.data);
+            let reports = events.files.lock().unwrap().clone();
+            assert_eq!(reports.first().unwrap().bytes_completed, retained as u64);
+            assert!(reports.windows(2).all(|p| p[0].bytes_completed <= p[1].bytes_completed));
+            assert!(
+                reports
+                    .iter()
+                    .filter(|p| p.status == FileStatus::InProgress)
+                    .all(|p| p.bytes_completed < p.total_bytes)
+            );
+            assert_eq!(reports.last().unwrap().status, FileStatus::Complete);
+            fixture.shutdown().await;
+        }
+    })
+    .await
+    .expect("network progress stalled before Xet produced output");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_xet_network_progress_is_not_a_resume_offset() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let fixture = Fixture::new(53).await;
+        let retained = 123456;
+        let partial = fixture.partial();
+        std::fs::write(&partial, &fixture.data[..retained]).unwrap();
+        fixture.state.hold_payload.store(true, Ordering::Relaxed);
+        let events = Arc::new(Events::default());
+        let repo = fixture.client().model("fixture", "resume");
+        {
+            let download = repo.download_file().filename("model.bin").progress(events.clone()).send();
+            let network_received = async {
+                loop {
+                    let changed = events.changed.notified();
+                    if events.files.lock().unwrap().iter().any(|p| p.bytes_completed > retained as u64) {
+                        break;
+                    }
+                    changed.await;
+                }
+            };
+            tokio::select! {
+                result = download => panic!("download finished while payload was withheld: {result:?}"),
+                () = network_received => {},
+            }
+        }
+        assert_eq!(std::fs::read(&partial).unwrap(), fixture.data[..retained]);
+        fixture.state.payload_permits.close();
+        fixture.state.hold_payload.store(false, Ordering::Relaxed);
+        fixture.state.ranges.lock().unwrap().clear();
+        let result = repo.download_file().filename("model.bin").send().await.unwrap();
+        assert_eq!(std::fs::read(result).unwrap(), fixture.data);
+        assert!(
+            fixture
+                .state
+                .ranges
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.starts_with(&format!("bytes={retained}-")))
+        );
+        fixture.shutdown().await;
+    })
+    .await
+    .expect("cancelled network progress did not resume from the saved prefix");
 }
